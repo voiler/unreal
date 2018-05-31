@@ -27,7 +27,6 @@ class Saver(object):
 
     def _restore(self, filename):
         path = self.model_checkpoint_path + '/' + filename
-        # start_epoch = self.module.load()
         print("=> loading checkpoint '{}'".format(path))
         checkpoint = th.load(path)
         start_epoch = checkpoint['epoch']
