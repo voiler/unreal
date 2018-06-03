@@ -3,7 +3,7 @@
 
 已完成 Atari部分
 
-参考[miyosuda]的复现(https://github.com/miyosuda/unreal)
+参考[miyosuda](https://github.com/miyosuda/unreal)的复现
 
 ## Requirements
 - Pytorch (0.4)
