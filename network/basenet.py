@@ -1,8 +1,5 @@
 from torch import nn
 import torch
-from absl import flags
-
-FLAGS = flags.FLAGS
 
 
 class BaseConvNet(nn.Module):

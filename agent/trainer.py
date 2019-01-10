@@ -1,14 +1,11 @@
-# -*- coding: utf-8 -*-
 import numpy as np
 import time
-import torch as th
+import torch
 from torch.nn import functional as F
 from environment.environment import Environment
 from .agent import Agent
 from experience.experience import Experience, ExperienceFrame
-from absl import flags
 
-FLAGS = flags.FLAGS
 LOG_INTERVAL = 100
 PERFORMANCE_LOG_INTERVAL = 1000
 
@@ -29,7 +26,9 @@ class Trainer(object):
                  gamma_pc,
                  experience_history_size,
                  max_global_time_step,
-                 optimizor):
+                 grad_norm_clip,
+                 optimizor,
+                 device):
 
         self.thread_index = thread_index
         self.env_name = env_name
@@ -48,7 +47,8 @@ class Trainer(object):
                                    use_value_replay,
                                    use_reward_prediction,
                                    pixel_change_lambda,
-                                   entropy_beta)
+                                   entropy_beta,
+                                   device)
 
         self.global_network = global_network
         self.experience = Experience(self.experience_history_size)
@@ -56,8 +56,8 @@ class Trainer(object):
         self.initial_learning_rate = initial_learning_rate
         self.episode_reward = 0
         self.optimizor = optimizor
-        self.distribution = th.distributions.Categorical
-        # For log output
+        self.distribution = torch.distributions.Categorical
+        self.grad_norm_clip = grad_norm_clip
         self.prev_local_t = 0
 
     def prepare(self):
@@ -80,7 +80,7 @@ class Trainer(object):
     def choose_action(self, pi):
         prob = F.softmax(pi, dim=1)
         m = self.distribution(prob)
-        return m.sample().numpy()[0]
+        return m.sample().cpu().numpy()[0]
 
     def _record_score(self, summary_writer, score, global_t):
         summary_writer.add_scalar("score", score, global_t)
@@ -98,13 +98,11 @@ class Trainer(object):
         last_action_reward = ExperienceFrame.concat_action_and_reward(last_action,
                                                                       self.action_size,
                                                                       last_reward)
-        pi_, _ = self.local_network(
-            [self.environment.last_state],
-            [last_action_reward])
-        action_id = pi_.detach()
-        if th.cuda.is_available():
-            action_id = action_id.cpu()
-        action = self.choose_action(action_id)
+        with torch.no_grad():
+            pi, _ = self.local_network(
+                self.environment.last_state[None, :],
+                last_action_reward[None, :])
+        action = self.choose_action(pi)
         new_state, reward, terminal, pixel_change = self.environment.process(action)
 
         frame = ExperienceFrame(prev_state, reward, action, terminal, pixel_change,
@@ -145,60 +143,40 @@ class Trainer(object):
             last_action_reward = ExperienceFrame.concat_action_and_reward(last_action,
                                                                           self.action_size,
                                                                           last_reward)
-
-            pi_, value_ = self.local_network(
-                [self.environment.last_state],
-                [last_action_reward])
-            pi_, value_ = pi_.detach(), value_.detach()
-            if th.cuda.is_available():
-                pi_, value_estimate = pi_.cpu(), value_.cpu()
+            with torch.no_grad():
+                pi_, value_ = self.local_network(
+                    self.environment.last_state[None, :],
+                    last_action_reward[None, :])
             action = self.choose_action(pi_)
             actions.append(action)
             states.append(self.environment.last_state)
             last_action_rewards.append(last_action_reward)
-
-            values.append(value_)
-
+            values.append(value_.cpu().numpy())
             if (self.thread_index == 0) and (self.local_t % LOG_INTERVAL == 0):
-                print("pi={}".format(pi_.numpy()))
-                print(" V={}".format(value_))
-
+                print("action={} V={:.6}".format(action, value_.cpu().numpy()))
             prev_state = self.environment.last_state
-
             # Process game
             new_state, reward, terminal, pixel_change = self.environment.process(action)
-
             frame = ExperienceFrame(prev_state, reward, action, terminal, pixel_change,
                                     last_action, last_reward)
-
-            # Store to experience
             self.experience.add_frame(frame)
-
             self.episode_reward += reward
-
             rewards.append(reward)
-
             self.local_t += 1
-
             if terminal:
                 terminal_end = True
                 print("score={}".format(self.episode_reward))
-
                 self._record_score(summary_writer, self.episode_reward, global_t)
-
                 self.episode_reward = 0
                 self.environment.reset()
                 self.local_network.reset_state()
                 break
-
         R = 0.0
         if not terminal_end:
-            _, R = self.local_network([new_state],
-                                      [frame.get_action_reward(self.action_size)])
-            R = R.detach()
-            if th.cuda.is_available():
-                R = R.cpu()
-            R = R.numpy()
+            with torch.no_grad():
+                _, R = self.local_network(new_state[None, :],
+                                          frame.get_action_reward(self.action_size)[None, :])
+            R = R.cpu().numpy()
         actions.reverse()
         states.reverse()
         rewards.reverse()
@@ -208,7 +186,6 @@ class Trainer(object):
         batch_a = []
         batch_adv = []
         batch_R = []
-
         for (ai, ri, si, Vi) in zip(actions, rewards, states, values):
             R = ri + self.gamma * R
             adv = R - Vi
@@ -218,20 +195,19 @@ class Trainer(object):
             batch_a.append(a)
             batch_adv.append(adv)
             batch_R.append(R)
-
         batch_si.reverse()
         batch_a.reverse()
         batch_adv.reverse()
         batch_R.reverse()
-        return batch_si, last_action_rewards, batch_a, batch_adv, batch_R, start_lstm_state
+
+        return np.array(batch_si), np.array(last_action_rewards), np.array(batch_a), \
+               np.array(batch_adv), np.array(batch_R), start_lstm_state
 
     def _process_pc(self):
         # [pixel change]
         # Sample 20+1 frame (+1 for last next state)
         pc_experience_frames = self.experience.sample_sequence(self.local_t_max + 1)
-        # Reverse sequence to calculate from the last
         pc_experience_frames.reverse()
-
         batch_pc_si = []
         batch_pc_a = []
         batch_pc_R = []
@@ -240,12 +216,12 @@ class Trainer(object):
         pc_R = np.zeros([20, 20], dtype=np.float32)
         if not pc_experience_frames[1].terminal:
             _, pc_q = self.local_network(
-                [pc_experience_frames[0].state],
-                [pc_experience_frames[0].get_last_action_reward(self.action_size)], name='pc')
+                pc_experience_frames[0].state[None, :],
+                pc_experience_frames[0].get_last_action_reward(self.action_size)[None, :], name='pc')
             pc_R = pc_q.detach()
-            if th.cuda.is_available():
+            if torch.cuda.is_available():
                 pc_R = pc_R.cpu()
-            pc_R = pc_R.numpy()
+            pc_R = pc_R.cpu().numpy()
 
         for frame in pc_experience_frames[1:]:
             pc_R = frame.pixel_change + self.gamma_pc * pc_R
@@ -263,7 +239,8 @@ class Trainer(object):
         batch_pc_R.reverse()
         batch_pc_last_action_reward.reverse()
 
-        return batch_pc_si, batch_pc_last_action_reward, batch_pc_a, batch_pc_R
+        return np.array(batch_pc_si), np.array(batch_pc_last_action_reward), \
+               np.array(batch_pc_a), np.array(batch_pc_R)
 
     def _process_vr(self):
         # [Value replay]
@@ -278,13 +255,11 @@ class Trainer(object):
 
         vr_R = 0.0
         if not vr_experience_frames[1].terminal:
-            _, vr_R = self.local_network(
-                [vr_experience_frames[0].state],
-                [vr_experience_frames[0].get_last_action_reward(self.action_size)])
-            vr_R = vr_R.detach()
-            if th.cuda.is_available():
-                vr_R = vr_R.cpu()
-            vr_R = vr_R.numpy()
+            with torch.no_grad():
+                _, vr_R = self.local_network(
+                    vr_experience_frames[0].state[None, :],
+                    vr_experience_frames[0].get_last_action_reward(self.action_size)[None, :])
+            vr_R = vr_R.cpu().numpy()
         # t_max times loop
         for frame in vr_experience_frames[1:]:
             vr_R = frame.reward + self.gamma * vr_R
@@ -297,7 +272,7 @@ class Trainer(object):
         batch_vr_R.reverse()
         batch_vr_last_action_reward.reverse()
 
-        return batch_vr_si, batch_vr_last_action_reward, batch_vr_R
+        return np.array(batch_vr_si), np.array(batch_vr_last_action_reward), np.array(batch_vr_R)
 
     def _process_rp(self):
         # [Reward prediction]
@@ -320,24 +295,18 @@ class Trainer(object):
         else:
             rp_c[2] = 1.0  # negative
         batch_rp_c.append(rp_c)
-        return batch_rp_si, batch_rp_c
+        return np.array(batch_rp_si), np.array(batch_rp_c)
 
     def process(self, global_t, summary_writer):
         # Fill experience replay buffer
         if not self.experience.is_full():
-            # print("fill ")
-            self.local_network.eval()
             self._fill_experience()
             return 0
-
         start_local_t = self.local_t
-
         cur_learning_rate = self._anneal_learning_rate(global_t)
-
         # [Base]
         batch_si, batch_last_action_rewards, batch_a, batch_adv, batch_R, start_lstm_state = \
             self._process_base(global_t, summary_writer)
-
         base_pi, base_v = self.local_network(batch_si, batch_last_action_rewards)
         loss_dict = {
             'base_pi': base_pi, 'batch_a': batch_a, 'batch_adv': batch_adv,
@@ -350,25 +319,23 @@ class Trainer(object):
         # [Value replay]
         if self.use_value_replay:
             batch_vr_si, batch_vr_last_action_reward, batch_vr_R = self._process_vr()
-            _, vr_v = self.local_network(batch_vr_si, batch_vr_last_action_reward)
+            vr_v = self.local_network(batch_vr_si, batch_vr_last_action_reward, name='vr')
             loss_dict.update({'batch_vr_r': batch_vr_R, 'vr_v': vr_v})
         # [Reward prediction]
         if self.use_reward_prediction:
             batch_rp_si, batch_rp_c = self._process_rp()
             rp_c = self.local_network(batch_rp_si, name='rp')
             loss_dict.update({'rp_c': rp_c, 'batch_rp_c': batch_rp_c})
-        self.local_network.train()
         # Calculate gradients and copy them to global network.
         self._adjust_learning_rate(cur_learning_rate)
         loss = self.local_network.loss(**loss_dict)
         self.optimizor.zero_grad()
         loss.backward()
-        th.nn.utils.clip_grad_norm_(self.local_network.parameters(), FLAGS.grad_norm_clip)
+        torch.nn.utils.clip_grad_norm_(self.local_network.parameters(), self.grad_norm_clip)
         self.local_network.sync_to(self.global_network)
         self.optimizor.step()
         self.local_network.sync_from(self.global_network)
         self._print_log(global_t)
-
         # Return advanced local step size
         diff_local_t = self.local_t - start_local_t
         return diff_local_t

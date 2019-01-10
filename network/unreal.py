@@ -1,9 +1,6 @@
 from torch import nn
 from torch.nn import functional as F
 import torch
-from absl import flags
-
-FLAGS = flags.FLAGS
 
 
 class LSTMConvNetwork(nn.Module):
